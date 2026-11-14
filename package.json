@@ -1,0 +1,26 @@
+{
+  "name": "display-shell-offset-studio",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Display-shell surface offset studio with independent thickness verification",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 5174",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "three": "0.187.0",
+    "three-mesh-bvh": "0.9.18"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^30.0.0",
+    "@types/three": "0.187.0",
+    "jsdom": "^31.0.1",
+    "typescript": "5.9.3",
+    "vite": "8.3.8",
+    "vitest": "5.1.0"
+  }
+}
