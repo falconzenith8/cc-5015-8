@@ -9,6 +9,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 0.0.0.0 --port 5174",
     "test": "vitest run",
+    "bench": "vitest run --config vitest.bench.config.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

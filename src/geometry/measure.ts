@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { MeshBVH } from 'three-mesh-bvh';
+import { ExtendedTriangle, MeshBVH } from 'three-mesh-bvh';
 import type {
   FeatureWarning,
   MeshTopology,
@@ -11,6 +11,7 @@ import type {
   VerificationReport,
 } from '../core/types';
 import { computeStats, computeTopology, computeVertexNormals, distanceToSegments, triangleArea } from './mesh';
+import { TriangleIntersectionIndex } from './intersectionIndex';
 
 export function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
@@ -551,11 +552,161 @@ export function detectSwallowedFeatures(
   };
 }
 
-export function detectSelfIntersections(mesh: TriMesh, maxPairs = 400_000): SelfIntersectionReport {
-  const degenerateTriangleCount = countDegenerate(mesh);
-  if (mesh.triangleCount === 0) {
-    return { pairCount: 0, testedPairs: 0, points: [], skippedPairCount: 0, degenerateTriangleCount };
+/**
+ * Shared exact triangle-pair predicate used by every self-intersection path.
+ * The accelerated grid path, the kept BVH reference and the brute-force anchor
+ * all run this identical test, so their verdicts can be compared pair by pair.
+ */
+interface PairTester {
+  /** Triangles sharing a vertex are topology neighbours, not self-intersections. */
+  sharesVertex(a: number, b: number): boolean;
+  /** Exact predicate: coplanar overlap area, otherwise a real crossing segment. */
+  intersects(a: number, b: number): boolean;
+  midpoint(a: number, b: number): [number, number, number];
+}
+
+function createPairTester(mesh: TriMesh): PairTester {
+  const positions = mesh.positions;
+  const indices = mesh.indices;
+  let extent = 0;
+  for (let v = 0; v < mesh.vertexCount; v++) {
+    extent = Math.max(extent,
+      Math.abs(positions[v * 3]), Math.abs(positions[v * 3 + 1]), Math.abs(positions[v * 3 + 2]));
   }
+  const selfIntersectionMinLength = Math.max(1e-6, extent * 2e-5);
+  const coplanarEps = Math.max(1e-6, extent * 1e-5);
+  const triA = new ExtendedTriangle();
+  const triB = new ExtendedTriangle();
+  const nA = new THREE.Vector3();
+  const tmp = new THREE.Vector3();
+  const intersectLine = new THREE.Line3();
+  const cA = new THREE.Vector3();
+  const cB = new THREE.Vector3();
+  const load = (t: number, target: ExtendedTriangle) => {
+    const ia = indices[t * 3] * 3;
+    const ib = indices[t * 3 + 1] * 3;
+    const ic = indices[t * 3 + 2] * 3;
+    target.a.set(positions[ia], positions[ia + 1], positions[ia + 2]);
+    target.b.set(positions[ib], positions[ib + 1], positions[ib + 2]);
+    target.c.set(positions[ic], positions[ic + 1], positions[ic + 2]);
+    target.needsUpdate = true;
+    return target;
+  };
+  return {
+    sharesVertex(a: number, b: number): boolean {
+      const a0 = indices[a * 3], a1 = indices[a * 3 + 1], a2 = indices[a * 3 + 2];
+      const b0 = indices[b * 3], b1 = indices[b * 3 + 1], b2 = indices[b * 3 + 2];
+      return a0 === b0 || a0 === b1 || a0 === b2 || a1 === b0 || a1 === b1 || a1 === b2 || a2 === b0 || a2 === b1 || a2 === b2;
+    },
+    intersects(a: number, b: number): boolean {
+      load(a, triA);
+      load(b, triB);
+      triA.getNormal(nA);
+      // three.js reports a bogus edge for coplanar pairs, so decide those with
+      // a projected 2D overlap-area test instead of the reported segment.
+      const d0 = nA.dot(tmp.subVectors(triB.a, triA.a));
+      const d1 = nA.dot(tmp.subVectors(triB.b, triA.a));
+      const d2 = nA.dot(tmp.subVectors(triB.c, triA.a));
+      if (Math.abs(d0) <= coplanarEps && Math.abs(d1) <= coplanarEps && Math.abs(d2) <= coplanarEps) {
+        const overlap = coplanarOverlapArea(triA, triB, nA);
+        return overlap > 1e-10 * extent * extent && overlap > triA.getArea() * 1e-3 && overlap > triB.getArea() * 1e-3;
+      }
+      // Non-coplanar: a real crossing leaves a segment. Touching at a single
+      // point (coincident cell vertices, folds) is not counted.
+      const seg = triA.intersectsTriangle(triB, intersectLine) ? intersectLine : null;
+      return seg !== null && seg.start.distanceTo(seg.end) > selfIntersectionMinLength;
+    },
+    midpoint(a: number, b: number): [number, number, number] {
+      load(a, triA);
+      load(b, triB);
+      triA.getMidpoint(cA);
+      triB.getMidpoint(cB);
+      cA.add(cB).multiplyScalar(0.5);
+      return [cA.x, cA.y, cA.z];
+    },
+  };
+}
+
+function emptySelfIntersection(degenerateTriangleCount: number): SelfIntersectionReport {
+  return { pairCount: 0, testedPairs: 0, candidatePairs: 0, points: [], skippedPairCount: 0, degenerateTriangleCount };
+}
+
+function runCandidateLoop(
+  mesh: TriMesh,
+  maxPairs: number,
+  forEachPair: (visit: (lo: number, hi: number) => void) => void,
+  onIntersection?: (lo: number, hi: number) => void,
+): SelfIntersectionReport {
+  const degenerateTriangleCount = countDegenerate(mesh);
+  if (mesh.triangleCount === 0) return emptySelfIntersection(degenerateTriangleCount);
+  const tester = createPairTester(mesh);
+  let pairCount = 0;
+  let testedPairs = 0;
+  let candidatePairs = 0;
+  let skipped = 0;
+  const points: Array<[number, number, number]> = [];
+  forEachPair((lo, hi) => {
+    candidatePairs++;
+    if (tester.sharesVertex(lo, hi)) return;
+    testedPairs++;
+    if (testedPairs > maxPairs) {
+      skipped++;
+      return;
+    }
+    if (tester.intersects(lo, hi)) {
+      pairCount++;
+      onIntersection?.(lo, hi);
+      if (points.length < 160) points.push(tester.midpoint(lo, hi));
+    }
+  });
+  return { pairCount, testedPairs, candidatePairs, points, skippedPairCount: skipped, degenerateTriangleCount };
+}
+
+/**
+ * Self-intersection detection accelerated by a conservative uniform-grid
+ * spatial index. The index emits exactly the AABB-overlapping triangle pairs —
+ * a superset of all truly intersecting pairs — so no intersection can be lost
+ * to the bounding-box approximation, including thin parallel sheets and
+ * triangles meeting at concave corners. Every candidate then runs the shared
+ * exact predicate, and the full candidate set is evaluated (no diagnostic
+ * cap unless the caller passes one).
+ */
+export function detectSelfIntersections(
+  mesh: TriMesh,
+  maxPairs = Number.POSITIVE_INFINITY,
+  onIntersection?: (lo: number, hi: number) => void,
+): SelfIntersectionReport {
+  if (mesh.triangleCount === 0) return emptySelfIntersection(countDegenerate(mesh));
+  return detectSelfIntersectionsWithIndex(mesh, new TriangleIntersectionIndex(mesh), maxPairs, onIntersection);
+}
+
+/**
+ * Same accelerated detection with a caller-supplied index (explicit cell size,
+ * or a reused index). The shell-query benchmark uses this to decompose the
+ * cost into index build, candidate generation and exact tests.
+ */
+export function detectSelfIntersectionsWithIndex(
+  mesh: TriMesh,
+  index: TriangleIntersectionIndex,
+  maxPairs = Number.POSITIVE_INFINITY,
+  onIntersection?: (lo: number, hi: number) => void,
+): SelfIntersectionReport {
+  if (mesh.triangleCount === 0) return emptySelfIntersection(countDegenerate(mesh));
+  return runCandidateLoop(mesh, maxPairs, (visit) => index.forEachCandidatePair(visit), onIntersection);
+}
+
+/**
+ * Kept as the display shell's running reference: the original BVH-vs-BVH
+ * (bvhcast) traversal with the identical exact predicate. The benchmark and
+ * the parity tests compare the accelerated path against this implementation.
+ */
+export function detectSelfIntersectionsReference(
+  mesh: TriMesh,
+  maxPairs = 400_000,
+  onIntersection?: (lo: number, hi: number) => void,
+): SelfIntersectionReport {
+  const degenerateTriangleCount = countDegenerate(mesh);
+  if (mesh.triangleCount === 0) return emptySelfIntersection(degenerateTriangleCount);
   const geo = toGeometry(mesh);
   const bvh = new MeshBVH(geo, { targetLeafSize: 16, indirect: true });
   const idx = geo.getIndex()!;
@@ -573,34 +724,16 @@ export function detectSelfIntersections(mesh: TriMesh, maxPairs = 400_000): Self
       list.push(t);
     }
   }
-  const triA = new THREE.Triangle();
-  const triB = new THREE.Triangle();
-  const triAt = (t: number, target: THREE.Triangle) => {
-    const ia = idx.getX(t * 3);
-    const ib = idx.getX(t * 3 + 1);
-    const ic = idx.getX(t * 3 + 2);
-    target.a.fromBufferAttribute(geo.getAttribute('position'), ia);
-    target.b.fromBufferAttribute(geo.getAttribute('position'), ib);
-    target.c.fromBufferAttribute(geo.getAttribute('position'), ic);
-    return target;
-  };
+  void edgeOwner;
+  const tester = createPairTester(mesh);
   let pairCount = 0;
   let testedPairs = 0;
   let skipped = 0;
   const points: Array<[number, number, number]> = [];
-  const cA = new THREE.Vector3();
-  const cB = new THREE.Vector3();
   const seen = new Set<string>();
-  const intersectLine = new THREE.Line3();
-  let extent = 0;
-  for (let v = 0; v < mesh.vertexCount; v++) {
-    extent = Math.max(extent,
-      Math.abs(mesh.positions[v * 3]), Math.abs(mesh.positions[v * 3 + 1]), Math.abs(mesh.positions[v * 3 + 2]));
-  }
-  const selfIntersectionMinLength = Math.max(1e-6, extent * 2e-5);
-  const coplanarEps = Math.max(1e-6, extent * 1e-5);
+  let candidatePairs = 0;
   bvh.bvhcast(bvh, new THREE.Matrix4(), {
-    intersectsTriangles: (ta, tb, raw1, raw2) => {
+    intersectsTriangles: (_ta, _tb, raw1, raw2) => {
       // BVH callbacks report primitive-buffer positions; with an indirect BVH
       // these must be resolved to the original triangle indices.
       const i1 = bvh.resolveTriangleIndex(raw1);
@@ -611,59 +744,93 @@ export function detectSelfIntersections(mesh: TriMesh, maxPairs = 400_000): Self
       const key = `${lo}_${hi}`;
       if (seen.has(key)) return false;
       seen.add(key);
-      // Two triangles sharing a vertex or an edge are topology neighbours, not
-      // self-intersections; a shell always has them.
-      const a0 = idx.getX(lo * 3), a1 = idx.getX(lo * 3 + 1), a2 = idx.getX(lo * 3 + 2);
-      const b0 = idx.getX(hi * 3), b1 = idx.getX(hi * 3 + 1), b2 = idx.getX(hi * 3 + 2);
-      if (a0 === b0 || a0 === b1 || a0 === b2 || a1 === b0 || a1 === b1 || a1 === b2 || a2 === b0 || a2 === b1 || a2 === b2) {
-        return false;
-      }
+      candidatePairs++;
+      if (tester.sharesVertex(lo, hi)) return false;
       testedPairs++;
       if (testedPairs > maxPairs) {
         skipped++;
         return false;
       }
-      triAt(lo, triA);
-      triAt(hi, triB);
-      // three.js reports a bogus edge for coplanar pairs, so decide those with
-      // a projected 2D overlap-area test instead of the reported segment.
-      const nA = triA.getNormal(new THREE.Vector3());
-      triB.getNormal(new THREE.Vector3());
-      const d0 = nA.dot(triB.a.clone().sub(triA.a));
-      const d1 = nA.dot(triB.b.clone().sub(triA.a));
-      const d2 = nA.dot(triB.c.clone().sub(triA.a));
-      if (Math.abs(d0) <= coplanarEps && Math.abs(d1) <= coplanarEps && Math.abs(d2) <= coplanarEps) {
-        const overlap = coplanarOverlapArea(triA, triB, nA);
-        if (overlap > 1e-10 * extent * extent && overlap > triA.getArea() * 1e-3 && overlap > triB.getArea() * 1e-3) {
-          pairCount++;
-          if (points.length < 160) {
-            mid(lo, hi, points);
-          }
-        }
-        return false;
-      }
-      // Non-coplanar: a real crossing leaves a segment. Touching at a single
-      // point (coincident cell vertices, folds) is not counted.
-      const seg = ta.intersectsTriangle(tb, intersectLine) ? intersectLine : null;
-      if (seg && seg.start.distanceTo(seg.end) > selfIntersectionMinLength) {
+      if (tester.intersects(lo, hi)) {
         pairCount++;
-        if (points.length < 160) {
-          mid(lo, hi, points);
-        }
+        onIntersection?.(lo, hi);
+        if (points.length < 160) points.push(tester.midpoint(lo, hi));
       }
       return false;
     },
   });
-  return { pairCount, testedPairs, points, skippedPairCount: skipped, degenerateTriangleCount };
+  return { pairCount, testedPairs, candidatePairs, points, skippedPairCount: skipped, degenerateTriangleCount };
+}
 
-  function mid(t1: number, t2: number, out: Array<[number, number, number]>) {
-    triAt(t1, triA);
-    triAt(t2, triB);
-    triA.getMidpoint(cA);
-    triB.getMidpoint(cB);
-    cA.add(cB).multiplyScalar(0.5);
-    out.push([cA.x, cA.y, cA.z]);
+/**
+ * O(n^2) all-pairs anchor for small meshes: every non-adjacent pair is tested
+ * with the shared predicate. This is the complete reference solution used to
+ * prove that the spatial index never drops a candidate (miss rate must be 0).
+ */
+export function detectSelfIntersectionsBruteForce(
+  mesh: TriMesh,
+  maxPairs = Number.POSITIVE_INFINITY,
+  onIntersection?: (lo: number, hi: number) => void,
+): SelfIntersectionReport {
+  return runCandidateLoop(mesh, maxPairs, (visit) => {
+    for (let lo = 0; lo < mesh.triangleCount; lo++) {
+      for (let hi = lo + 1; hi < mesh.triangleCount; hi++) {
+        visit(lo, hi);
+      }
+    }
+  }, onIntersection);
+}
+
+export interface IncrementalSelfIntersection {
+  report: SelfIntersectionReport;
+  /** All intersecting pairs after the edit, as (lo, hi) triangle id pairs. */
+  intersectingPairs: Array<[number, number]>;
+}
+
+/**
+ * Local intersection acceleration after a model edit. The caller keeps one
+ * TriangleIntersectionIndex alive across edits; after vertices move, the index
+ * is re-hashed only for the affected triangles (`updateTriangles`) and only
+ * candidate pairs touching them are re-tested. Pairs untouched by the edit
+ * keep their previous verdicts, so the merged result equals a full re-query
+ * at a cost proportional to the edited region.
+ *
+ * Computation order: (1) re-hash affected triangles, (2) stream candidate
+ * pairs involving them, (3) run the shared exact predicate on those,
+ * (4) merge with the untouched prior intersections.
+ */
+export function detectSelfIntersectionsAfterEdit(
+  index: TriangleIntersectionIndex,
+  mesh: TriMesh,
+  affectedTriangles: Iterable<number>,
+  priorIntersectingPairs: Iterable<[number, number]>,
+  maxPairs = Number.POSITIVE_INFINITY,
+): IncrementalSelfIntersection {
+  const affectedSet = new Set<number>();
+  for (const t of affectedTriangles) affectedSet.add(t);
+  index.updateTriangles(mesh, affectedSet);
+  const kept: Array<[number, number]> = [];
+  for (const [lo, hi] of priorIntersectingPairs) {
+    if (!affectedSet.has(lo) && !affectedSet.has(hi)) kept.push([lo, hi]);
   }
+  const fresh: Array<[number, number]> = [];
+  const report = runCandidateLoop(
+    mesh,
+    maxPairs,
+    (visit) => index.forEachCandidatePairInvolving(affectedSet, visit),
+    (lo, hi) => fresh.push([lo, hi]),
+  );
+  const intersectingPairs = kept.concat(fresh);
+  const tester = createPairTester(mesh);
+  const points: Array<[number, number, number]> = [];
+  for (const [lo, hi] of intersectingPairs) {
+    if (points.length >= 160) break;
+    points.push(tester.midpoint(lo, hi));
+  }
+  return {
+    report: { ...report, pairCount: intersectingPairs.length, points },
+    intersectingPairs,
+  };
 }
 
 /**

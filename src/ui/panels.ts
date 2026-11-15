@@ -249,7 +249,7 @@ export function renderResults(root: HTMLElement, result: ShellResult | null, run
         <div class="k">闭合 / 边界边 / 边界环</div><div class="v">${output.stats.closed ? '是' : '否'} / ${output.stats.boundaryEdgeCount} / ${output.stats.boundaryLoopCount}</div>
         <div class="k">非流形 / 非一致定向边</div><div class="v">${output.stats.nonManifoldEdgeCount} / ${output.stats.inconsistentEdgeCount}</div>
         <div class="k">外表面 / 内表面 / 边缘面积</div><div class="v">${fmt(output.classAreas[0])} / ${fmt(output.classAreas[1])} / ${fmt(output.classAreas[2])}</div>
-        <div class="k">自交对</div><div class="v">${result.selfIntersection ? result.selfIntersection.pairCount : '未执行'}</div>
+        <div class="k">自交对（候选 / 精确判定）</div><div class="v">${result.selfIntersection ? `${result.selfIntersection.pairCount}（${result.selfIntersection.candidatePairs} / ${result.selfIntersection.testedPairs}）` : '未执行'}</div>
         <div class="k">场分辨率 / 间距</div><div class="v">${result.domain.dims.join('×')} / ${fmt(result.domain.spacing)}</div>
         <div class="k">耗时 场 / 等值面 / 测厚</div><div class="v">${Math.round(result.fieldBuildMs)} / ${Math.round(result.isoMs)} / ${Math.round(result.measureMs)} ms</div>
         <div class="k">输入几何哈希</div><div class="v" title="${escapeHtml(result.input.hash)}">${escapeHtml(result.input.hash.slice(0, 16))}…</div>

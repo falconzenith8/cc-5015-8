@@ -133,6 +133,8 @@ export interface FeatureWarning {
 export interface SelfIntersectionReport {
   pairCount: number;
   testedPairs: number;
+  /** Candidate pairs produced by the conservative spatial filter before exact tests. */
+  candidatePairs: number;
   points: Array<[number, number, number]>;
   skippedPairCount: number;
   degenerateTriangleCount: number;

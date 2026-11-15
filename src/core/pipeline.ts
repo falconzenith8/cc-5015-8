@@ -518,7 +518,7 @@ export function runOffset(inputMesh: TriMesh, opts: RunOptions): ShellResult {
     selfStatus,
     !selfIntersection
       ? '未执行或超出规模上限。'
-      : `逐对检测 ${selfIntersection.testedPairs} 个不相邻三角形对，发现 ${selfIntersection.pairCount} 个相交对` +
+      : `空间索引筛出 ${selfIntersection.candidatePairs} 个候选对，逐对精确判定 ${selfIntersection.testedPairs} 个不相邻三角形对，发现 ${selfIntersection.pairCount} 个相交对` +
         (selfIntersection.skippedPairCount ? `；${selfIntersection.skippedPairCount} 对因上限未判定。` : '。'),
     selfIntersection ? `${selfIntersection.pairCount} 对` : '跳过',
   );
